@@ -129,5 +129,5 @@ def main():
 
 if __name__ == "__main__":
     if opt.preprocess:
-        prepare_data(data_path="data", patch_size=40 if opt.mode == "S" else 50, stride=10, aug_times=1 if opt.mode == "S" else 2)
+        prepare_data(data_path="/kaggle/working/train", patch_size=40 if opt.mode == "S" else 50, stride=10, aug_times=1 if opt.mode == "S" else 2)
     main()
