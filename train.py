@@ -125,7 +125,9 @@ def main():
             writer.add_image("Reconstructed Image", Irecon, epoch)
 
         # Save model
-        torch.save(net.state_dict(), os.path.join(opt.outf, "net.pth"))
+        model_path = os.path.join(opt.outf, f"net_epoch_{epoch+1}.pth")
+        torch.save(net.state_dict(), model_path)
+        print(f"Model saved: {model_path}")
 
 if __name__ == "__main__":
     if opt.preprocess:
