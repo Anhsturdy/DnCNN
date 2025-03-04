@@ -59,6 +59,17 @@ def main():
         # Forward pass (inference)
         with torch.no_grad():
             Out = torch.clamp(INoisy - model(INoisy), 0.0, 1.0)
+            
+        # Convert output tensor to image format
+        Out_img = Out.squeeze().cpu().numpy() * 255  # Convert back to [0, 255]
+        Out_img = np.uint8(Out_img)  # Convert to uint8
+
+        # Save the image
+        output_dir = "denoised_results"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, os.path.basename(f))
+        cv2.imwrite(output_path, Out_img)
+        print(f"Saved denoised image to {output_path}")
 
         # Compute PSNR
         psnr = batch_PSNR(Out, ISource, 1.0)
