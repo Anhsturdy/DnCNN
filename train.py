@@ -5,122 +5,129 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.utils as utils
-from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 from models import DnCNN
 from dataset import prepare_data, Dataset
-from utils import *
+from utils import batch_PSNR, weights_init_kaiming  # Ensure these functions exist
 
+# Set CUDA device
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+# Argument Parser
 parser = argparse.ArgumentParser(description="DnCNN")
-parser.add_argument("--preprocess", type=bool, default=False, help='run prepare_data or not')
+parser.add_argument("--preprocess", type=bool, default=False, help="Run prepare_data or not")
 parser.add_argument("--batchSize", type=int, default=128, help="Training batch size")
 parser.add_argument("--num_of_layers", type=int, default=17, help="Number of total layers")
 parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
 parser.add_argument("--milestone", type=int, default=30, help="When to decay learning rate; should be less than epochs")
 parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
-parser.add_argument("--outf", type=str, default="logs", help='path of log files')
-parser.add_argument("--mode", type=str, default="S", help='with known noise level (S) or blind training (B)')
-parser.add_argument("--noiseL", type=float, default=25, help='noise level; ignored when mode=B')
-parser.add_argument("--val_noiseL", type=float, default=25, help='noise level used on validation set')
+parser.add_argument("--outf", type=str, default="logs", help="Path of log files")
+parser.add_argument("--mode", type=str, default="S", help="With known noise level (S) or blind training (B)")
+parser.add_argument("--noiseL", type=float, default=25, help="Noise level; ignored when mode=B")
+parser.add_argument("--val_noiseL", type=float, default=25, help="Noise level used on validation set")
 opt = parser.parse_args()
 
 def main():
+    # Set device (GPU or CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # Load dataset
-    print('Loading dataset ...\n')
+    print("Loading dataset...\n")
     dataset_train = Dataset(train=True)
     dataset_val = Dataset(train=False)
     loader_train = DataLoader(dataset=dataset_train, num_workers=4, batch_size=opt.batchSize, shuffle=True)
-    print("# of training samples: %d\n" % int(len(dataset_train)))
+
+    print(f"# of training samples: {len(dataset_train)}\n")
+
     # Build model
     net = DnCNN(channels=1, num_of_layers=opt.num_of_layers)
     net.apply(weights_init_kaiming)
-    criterion = nn.MSELoss(size_average=False)
-    # Move to GPU
-    device_ids = [0]
-    model = nn.DataParallel(net, device_ids=device_ids).cuda()
-    criterion.cuda()
-    # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=opt.lr)
-    # training
+    net = net.to(device)
+
+    criterion = nn.MSELoss(reduction="sum").to(device)  # Updated `size_average=False` → `reduction='sum'`
+    optimizer = optim.Adam(net.parameters(), lr=opt.lr)
+    
     writer = SummaryWriter(opt.outf)
     step = 0
-    noiseL_B=[0,55] # ingnored when opt.mode=='S'
+    noiseL_B = [0, 55]  # Ignored when opt.mode == 'S'
+
     for epoch in range(opt.epochs):
-        if epoch < opt.milestone:
-            current_lr = opt.lr
-        else:
-            current_lr = opt.lr / 10.
-        # set learning rate
+        # Adjust learning rate
+        current_lr = opt.lr if epoch < opt.milestone else opt.lr / 10
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
-        print('learning rate %f' % current_lr)
-        # train
-        for i, data in enumerate(loader_train, 0):
-            # training step
-            model.train()
-            model.zero_grad()
-            optimizer.zero_grad()
-            img_train = data
-            if opt.mode == 'S':
-                noise = torch.FloatTensor(img_train.size()).normal_(mean=0, std=opt.noiseL/255.)
-            if opt.mode == 'B':
-                noise = torch.zeros(img_train.size())
-                stdN = np.random.uniform(noiseL_B[0], noiseL_B[1], size=noise.size()[0])
-                for n in range(noise.size()[0]):
-                    sizeN = noise[0,:,:,:].size()
-                    noise[n,:,:,:] = torch.FloatTensor(sizeN).normal_(mean=0, std=stdN[n]/255.)
+        print(f"Learning rate: {current_lr:.6f}")
+
+        # Training loop
+        net.train()
+        for i, data in enumerate(loader_train):
+            img_train = data.to(device)
+
+            # Add noise
+            if opt.mode == "S":
+                noise = torch.randn_like(img_train) * (opt.noiseL / 255.0)
+            else:  # Blind training mode
+                noise = torch.zeros_like(img_train)
+                stdN = np.random.uniform(noiseL_B[0], noiseL_B[1], size=noise.size(0))
+                for n in range(noise.size(0)):
+                    noise[n] = torch.randn_like(noise[n]) * (stdN[n] / 255.0)
+
             imgn_train = img_train + noise
-            img_train, imgn_train = Variable(img_train.cuda()), Variable(imgn_train.cuda())
-            noise = Variable(noise.cuda())
-            out_train = model(imgn_train)
-            loss = criterion(out_train, noise) / (imgn_train.size()[0]*2)
+            noise = noise.to(device)
+
+            # Forward pass
+            optimizer.zero_grad()
+            out_train = net(imgn_train)
+            loss = criterion(out_train, noise) / (imgn_train.size(0) * 2)
             loss.backward()
             optimizer.step()
-            # results
-            model.eval()
-            out_train = torch.clamp(imgn_train-model(imgn_train), 0., 1.)
-            psnr_train = batch_PSNR(out_train, img_train, 1.)
-            print("[epoch %d][%d/%d] loss: %.4f PSNR_train: %.4f" %
-                (epoch+1, i+1, len(loader_train), loss.item(), psnr_train))
-            # if you are using older version of PyTorch, you may need to change loss.item() to loss.data[0]
+
+            # Compute PSNR
+            with torch.no_grad():
+                out_train_clamped = torch.clamp(imgn_train - net(imgn_train), 0.0, 1.0)
+                psnr_train = batch_PSNR(out_train_clamped, img_train, 1.0)
+
+            print(f"[Epoch {epoch+1}][{i+1}/{len(loader_train)}] Loss: {loss.item():.4f} PSNR_train: {psnr_train:.4f}")
+
+            # Log training progress
             if step % 10 == 0:
-                # Log the scalar values
-                writer.add_scalar('loss', loss.item(), step)
-                writer.add_scalar('PSNR on training data', psnr_train, step)
+                writer.add_scalar("Loss", loss.item(), step)
+                writer.add_scalar("PSNR on training data", psnr_train, step)
             step += 1
-        ## the end of each epoch
-        model.eval()
-        # validate
+
+        # Validation phase
+        net.eval()
         psnr_val = 0
-        for k in range(len(dataset_val)):
-            img_val = torch.unsqueeze(dataset_val[k], 0)
-            noise = torch.FloatTensor(img_val.size()).normal_(mean=0, std=opt.val_noiseL/255.)
-            imgn_val = img_val + noise
-            img_val, imgn_val = Variable(img_val.cuda(), volatile=True), Variable(imgn_val.cuda(), volatile=True)
-            out_val = torch.clamp(imgn_val-model(imgn_val), 0., 1.)
-            psnr_val += batch_PSNR(out_val, img_val, 1.)
+        with torch.no_grad():
+            for k in range(len(dataset_val)):
+                img_val = dataset_val[k].unsqueeze(0).to(device)
+                noise = torch.randn_like(img_val) * (opt.val_noiseL / 255.0)
+                imgn_val = img_val + noise
+
+                out_val = torch.clamp(imgn_val - net(imgn_val), 0.0, 1.0)
+                psnr_val += batch_PSNR(out_val, img_val, 1.0)
+
         psnr_val /= len(dataset_val)
-        print("\n[epoch %d] PSNR_val: %.4f" % (epoch+1, psnr_val))
-        writer.add_scalar('PSNR on validation data', psnr_val, epoch)
-        # log the images
-        out_train = torch.clamp(imgn_train-model(imgn_train), 0., 1.)
-        Img = utils.make_grid(img_train.data, nrow=8, normalize=True, scale_each=True)
-        Imgn = utils.make_grid(imgn_train.data, nrow=8, normalize=True, scale_each=True)
-        Irecon = utils.make_grid(out_train.data, nrow=8, normalize=True, scale_each=True)
-        writer.add_image('clean image', Img, epoch)
-        writer.add_image('noisy image', Imgn, epoch)
-        writer.add_image('reconstructed image', Irecon, epoch)
-        # save model
-        torch.save(model.state_dict(), os.path.join(opt.outf, 'net.pth'))
+        print(f"\n[Epoch {epoch+1}] PSNR_val: {psnr_val:.4f}")
+        writer.add_scalar("PSNR on validation data", psnr_val, epoch)
+
+        # Save images for visualization
+        with torch.no_grad():
+            out_train_clamped = torch.clamp(imgn_train - net(imgn_train), 0.0, 1.0)
+            Img = utils.make_grid(img_train, nrow=8, normalize=True, scale_each=True)
+            Imgn = utils.make_grid(imgn_train, nrow=8, normalize=True, scale_each=True)
+            Irecon = utils.make_grid(out_train_clamped, nrow=8, normalize=True, scale_each=True)
+
+            writer.add_image("Clean Image", Img, epoch)
+            writer.add_image("Noisy Image", Imgn, epoch)
+            writer.add_image("Reconstructed Image", Irecon, epoch)
+
+        # Save model
+        torch.save(net.state_dict(), os.path.join(opt.outf, "net.pth"))
 
 if __name__ == "__main__":
     if opt.preprocess:
-        if opt.mode == 'S':
-            prepare_data(data_path='data', patch_size=40, stride=10, aug_times=1)
-        if opt.mode == 'B':
-            prepare_data(data_path='data', patch_size=50, stride=10, aug_times=2)
+        prepare_data(data_path="data", patch_size=40 if opt.mode == "S" else 50, stride=10, aug_times=1 if opt.mode == "S" else 2)
     main()
